@@ -1,1 +1,322 @@
-The tool is capable of crawling a domain or subdomain's source code. It can detect any sensitive information, such as tokens or secrets, using regex patterns. Additionally, the tool is compatible with JavaScript crawling; it can crawl JavaScript files to identify any sensitive information, links, or paths, and then provide the results to us.
+#!/usr/bin/env python3
+
+import requests
+import re
+import sys
+import threading
+from queue import Queue, Empty
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+
+# Updated PATTERNS with all regexes, fixed for compilation
+PATTERNS = {
+    "urls": r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[^\s\'"]*',
+    "paths": r'/(?:[a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+\.(?:js|html|php|asp|aspx)?',
+    "relative_paths": r'(?:\.\./|\./)[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*',
+    "emails": r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+    "sensitive_words": r'\b(login|admin|user|pass|cred|key|secret|token|private|debug)\b',
+    "google_api": r'AIza[0-9A-Za-z-_]{35}\b',
+    "firebase": r'AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}\b',
+    "google_captcha": r'6L[0-9A-Za-z-_]{38}\b|6[0-9a-zA-Z_-]{39}\b',
+    "google_oauth": r'ya29\.[0-9A-Za-z\-_]{50,}\b',
+    "amazon_aws_access_key_id": r'\bA[SK]IA[0-9A-Z]{16}\b',
+    "amazon_mws_auth_token": r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    "amazon_aws_url": r'(?:https?://)?(?:[a-zA-Z0-9_-]+\.)?s3\.amazonaws\.com(?:/[^\s\'"]*)?',
+    "amazon_aws_url2": r'(?:https?://)?(?:[a-zA-Z0-9-\._]+\.s3\.amazonaws\.com|s3://[a-zA-Z0-9-\._]+|s3-[a-zA-Z0-9-\._/]+|s3\.amazonaws\.com/[a-zA-Z0-9-\._]+|s3\.console\.aws\.amazon\.com/s3/buckets/[a-zA-Z0-9-\._]+)',
+    "facebook_access_token": r'EAACEdEose0cBA[0-9A-Za-z]{20,}\b',
+    "authorization_basic": r'basic\s+[a-zA-Z0-9=:_\+\/-]{20,100}\b',
+    "authorization_bearer": r'bearer\s+[a-zA-Z0-9_\-\.=:_\+\/]{20,100}\b',
+    "authorization_api": r'api(?:key|_key|\s+)[=:]?\s*[a-zA-Z0-9_\-]{20,100}\b',
+    "mailgun_api_key": r'key-[0-9a-zA-Z]{32}\b',
+    "twilio_api_key": r'SK[0-9a-fA-F]{32}\b',
+    "twilio_account_sid": r'AC[0-9a-fA-F]{32}\b',
+    "twilio_app_sid": r'AP[0-9a-fA-F]{32}\b',
+    "paypal_braintree_access_token": r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}\b',
+    "square_oauth_secret": r'sq0csp-[0-9A-Za-z\-_]{43}\b|sq0[a-z]{3}-[0-9A-Za-z\-_]{22,43}\b',
+    "square_access_token": r'sq0atp-[0-9A-Za-z\-_]{22}\b|EAAA[a-zA-Z0-9]{60}\b',
+    "stripe_standard_api": r'sk_live_[0-9a-zA-Z]{24}\b',
+    "stripe_restricted_api": r'rk_live_[0-9a-zA-Z]{24}\b',
+    "github_access_token": r'(?:ghp|gho|ghu|ghs)_[0-9A-Za-z]{36}\b',
+    "rsa_private_key": r'-----BEGIN RSA PRIVATE KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END RSA PRIVATE KEY-----',
+    "ssh_dsa_private_key": r'-----BEGIN DSA PRIVATE KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END DSA PRIVATE KEY-----',
+    "ssh_ec_private_key": r'-----BEGIN EC PRIVATE KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END EC PRIVATE KEY-----',
+    "pgp_private_block": r'-----BEGIN PGP PRIVATE KEY BLOCK-----\n(?:[A-Za-z0-9+/=]+\n)+-----END PGP PRIVATE KEY BLOCK-----',
+    "json_web_token": r'ey[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]{20,}\b',
+    "slack_token": r'xox[bp]-[0-9A-Za-z\-]{20,}\b',
+    "ssh_priv_key": r'-----BEGIN (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----',
+    "heroku_api_key": r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
+    "possible_creds": r'(?:password|pwd|passwd)\s*[:=]\s*[^\s\'";,]{6,}\b',
+    "microsoft_azure_key": r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
+    "gcp_service_account": r'"private_key":\s*"-----BEGIN PRIVATE KEY-----\n(?:[A-Za-z0-9+/=]+\n)+-----END PRIVATE KEY-----"',
+    "cloudflare_api": r'[0-9a-f]{37}\b',
+    "jwt_secret_comment": r'(?:jwt[_-]?secret|hs256[_-]?key)\s*[:=]\s*[a-zA-Z0-9_\-]{20,}\b',
+    "database_url": r'(?:mysql|postgres|sqlite|mssql)://(?:[a-zA-Z0-9_]+:[^\s\'"]+@)?[a-zA-Z0-9\.-]+(?:/[a-zA-Z0-9_]+)?',
+    "crypto_wallet": r'\b(?:bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[a-fA-F0-9]{40})\b',
+    # Your new regexes integrated, with inline (?i) removed
+    "zoho_creator_api": r'https://creator\.zoho\.com/api/[A-Za-z0-9/\-_\.]+\?authtoken=[A-Za-z0-9]+',
+    "adafruit_key": r'(?:adafruit)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9_-]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "adobe_key": r'(?:adobe)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-f0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "adobe_oauth_p8e": r'\b(p8e-[a-z0-9-]{32})(?:[^a-z0-9-]|$)',
+    "adobe_oauth_age1": r'\bage1[0-9a-z]{58}\b',
+    "adobe_oauth_age_secret": r'\bAGE-SECRET-KEY-1[0-9A-Z]{58}\b',
+    "airtable_key": r'(?:airtable)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{17})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "algolia_key": r'(?:algolia)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "alibaba_ltai": r'\b((LTAI)[a-z0-9]{20})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "alibaba_key": r'(?:alibaba)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{30})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "aws_sns_arn": r'arn:aws:sns:[a-z0-9\-]+:[0-9]+:[A-Za-z0-9\-_]+',
+    "aws_key": r'\b((?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16})\b',
+    "aws_account_id": r'aws_?(?:account)_?(?:id)?["\'`]?\s{0,30}(?::|=>|=)\s{0,30}["\'`]?([0-9]{4}-?[0-9]{4}-?[0-9]{4})',
+    "aws_session_token": r'(?:aws.?session|aws.?session.?token|aws.?token)["\'`]?\s{0,30}(?::|=>|=)\s{0,30}["\'`]?([a-z0-9/+=]{16,200})[^a-z0-9/+=]',
+    "artifactory_ap": r'(?:\s|=|:|"|^)AP[\dABCDEF][a-zA-Z0-9]{8,}$',
+    "artifactory_akc": r'(?:\s|=|:|"|^)AKC[a-zA-Z0-9]{10,}',
+    "asana_key_16": r'(?:asana)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([0-9]{16})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "asana_key_32": r'(?:asana)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "atlassian_key": r'(?:atlassian|confluence|jira)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{24})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "azure_shared_access": r'(?:AccountName|SharedAccessKeyName|SharedSecretIssuer)\s*=\s*([^;]{1,80})\s*;\s*.{0,10}\s*(?:AccountKey|SharedAccessKey|SharedSecretValue)\s*=\s*([^;]{1,100})(?:;|$)',
+    "beamer_key": r'(?:beamer)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}(b_[a-z0-9=_\-]{44})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "bitbucket_key_32": r'(?:bitbucket)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "bitbucket_key_64": r'(?:bitbucket)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9=_\-]{64})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "bitly_key": r'R_[0-9a-f]{32}',
+    "bittrex_key": r'(?:bittrex)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "clojars_key": r'(CLOJARS_)[a-z0-9]{60}',
+    "cloudinary_url": r'cloudinary://[0-9]+:[A-Za-z0-9\-_\.]+@[A-Za-z0-9\-_\.]+',
+    "codeclima_key": r'codeclima.{0,50}\b([a-f0-9]{64})\b',
+    "codecov_key": r'(?:codecov)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "coinbase_key": r'(?:coinbase)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9_-]{64})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "confluent_key_16": r'(?:confluent)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{16})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "confluent_key_64": r'(?:confluent)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{64})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "contentful_key": r'(?:contentful)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9=_\-]{43})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "crates_key": r'\bcio[a-zA-Z0-9]{32}\b',
+    "datadog_api": r'\b(dapi[a-h0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "datadog_key": r'(?:datadog)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{40})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "onedesk_token": r'\b(odt_[A-Za-z0-9]{32,255})\b',
+    "digitalocean_key": r'\"do_key\"\: .*',
+    "doppler_v1": r'\b(dop_v1_[a-f0-9]{64})\b',
+    "doppler_v1_alt": r'\b(doo_v1_[a-f0-9]{64})\b',
+    "doppler_v1_red": r'\b(dor_v1_[a-f0-9]{64})\b',
+    "generic_access_token": r'access_token: .*',
+    "discord_id": r'(?:discord)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([0-9]{18})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "discord_key_32": r'(?:discord)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9=_\-]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "discord_key_64": r'(?:discord)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-f0-9]{64})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "discord_webhook": r'https://discordapp\.com/api/webhooks/[0-9]+/[A-Za-z0-9\-]+',
+    "docker_personal_access": r'\b(dckr_pat_[a-zA-Z0-9_-]{27})(?:$|[^a-zA-Z0-9_-])',
+    "dropbox_audit": r'\b(dp\.audit\.[a-zA-Z0-9]{40,44})\b',
+    "dropbox_ct": r'\b(dp\.ct\.[a-zA-Z0-9]{40,44})\b',
+    "dropbox_scim": r'\b(dp\.scim\.[a-zA-Z0-9]{40,44})\b',
+    "dropbox_sa": r'\b(dp\.sa\.[a-zA-Z0-9]{40,44})\b',
+    "dropbox_st": r'\b(dp\.st\.(?:[a-z0-9\-_]{2,35}\.)?[a-zA-Z0-9]{40,44})\b',
+    "dropbox_pt": r'(dp\.pt\.)([a-z0-9]{43})',
+    "droneci_key": r'(?:droneci)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{32})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "dropbox_sl_long": r'\b(sl\.[a-zA-Z0-9_-]{130,152})(?:$|[^a-zA-Z0-9_-])',
+    "dropbox_key_aaa": r'(?:dropbox)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{11}(AAAAAAAAAA)[a-z0-9\-_=]{43})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "dropbox_sl": r'(?:dropbox)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}(sl\.[a-z0-9\-=_]{135})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "dropbox_short": r'(?:dropbox)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|\']|[\s|"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:\'|\"|\s|=|\x60){0,5}([a-z0-9]{15})(?:[\'|\"|\n|\r|\s|\x60|;]|$)',
+    "duffel_key": r'duffel_(test|live)_([a-z0-9_\-=]{43})',
+    "dynatrace_token": r'\b(dt0[a-zA-Z]{1}[0-9]{2}\.[A-Z0-9]{24}\.[A-Z0-9]{64})\b',
+    "etsy_key_54": r"EZTK[a-z0-9]{54}",
+    "etsy_access_key_54": r"EZAK[a-z0-9]{54}",
+    "etsy_api_key": r"(?:etsy)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-z0-9]{24})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "facebook_long_token": r"\b(EAACEdEose0cBA[a-zA-Z0-9]+)\b",
+    "facebook_key": r"(?:facebook)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-f0-9]{32})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "fastly_key": r"(?:fastly)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-z0-9=_\-]{32})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "figma_key": r"figma.{0,20}\b([0-9a-f]{4}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
+    "finicity_key_20": r"(?:finicity)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-z0-9]{20})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "finicity_key_32": r"(?:finicity)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-f0-9]{32})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "finnhub_key": r"(?:finnhub)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-z0-9]{20})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "flickr_key": r"(?:flickr)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-z0-9]{32})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "flutterwave_secret_test": r"FLWSECK_TEST-[a-h0-9]{12}",
+    "flutterwave_public_test": r"FLWPUBK_TEST-[a-h0-9]{32}-X",
+    "flutterwave_secret_test_x": r"FLWSECK_TEST-[a-h0-9]{32}-X",
+    "fio_key": r"fio-u-[a-z0-9\-_=]{64}",
+    "freshbooks_key": r"(?:freshbooks)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|\"]){0,3}(?:=|>|:=|\|\|:|<=|=>|:)(?:'|\"|\s|=|\x60){0,5}([a-z0-9]{64})(?:['|\"|\n|\r|\s|\x60|;]|$)",
+    "zopim_key": r'["\']?zopim[_-]?account[_-]?key["\']?[^\\S\r\n]*[=:][^\\S\r\n]*["\']?[\\w-]+["\']?',
+    "generic_access_key_secret": r'["\']?access[_-]?key[_-]?secret["\']?[^\\S\r\n]*[=:][^\\S\r\n]*["\']?[\\w-]+["\']?'
+}
+
+# Compile patterns with case-insensitivity
+COMPILED_PATTERNS = {}
+for key, pattern in PATTERNS.items():
+    try:
+        COMPILED_PATTERNS[key] = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        print(f"Warning: Skipping invalid pattern '{key}': {pattern} - Error: {e}")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+VISITED_URLS = set()
+VISITED_URLS_LOCK = threading.Lock()
+MAX_DEPTH = 3
+OUTPUT_LOCK = threading.Lock()
+URL_QUEUE = Queue()
+DONE_EVENT = threading.Event()
+
+def fetch_content(url):
+    """Fetch content from a URL, return content and status code."""
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        return response.text, response.status_code, None
+    except requests.RequestException as e:
+        return None, None, str(e)
+
+def is_valid_path(url):
+    """Check if a URL/path is accessible (returns 200)."""
+    try:
+        response = requests.head(url, headers=HEADERS, timeout=5, allow_redirects=True)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+def extract_js_from_html(html_content, base_url, allowed_domain):
+    """Extract JS file URLs from HTML content, including subdomains."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    js_urls = set()
+    base_domain = f".{allowed_domain}"
+
+    for script in soup.find_all('script', src=True):
+        js_url = urljoin(base_url, script['src'])
+        parsed_js = urlparse(js_url)
+        if (parsed_js.netloc == allowed_domain or parsed_js.netloc.endswith(base_domain) or not parsed_js.netloc) and js_url.endswith('.js'):
+            if is_valid_path(js_url):
+                js_urls.add(js_url)
+    return list(js_urls)
+
+def crawl_content(content, base_url, allowed_domain, content_type="js"):
+    """Crawl content for sensitive info, paths, and URLs, including subdomains."""
+    findings = {}
+    parsed_base = urlparse(base_url)
+    base_domain = f".{allowed_domain}"
+
+    for key, pattern in COMPILED_PATTERNS.items():
+        matches = set(pattern.findall(content))
+        if matches:
+            if key == "urls":
+                resolved_urls = set()
+                for match in matches:
+                    resolved_url = urljoin(base_url, match) if not match.startswith(('http://', 'https://')) else match
+                    parsed_url = urlparse(resolved_url)
+                    if (parsed_url.netloc == allowed_domain or parsed_url.netloc.endswith(base_domain)) and is_valid_path(resolved_url):
+                        resolved_urls.add(resolved_url)
+                findings[key] = list(resolved_urls)
+            elif key in ("paths", "relative_paths"):
+                valid_paths = set()
+                for match in matches:
+                    full_path = urljoin(base_url, match)
+                    parsed_path = urlparse(full_path)
+                    if (parsed_path.netloc == allowed_domain or parsed_path.netloc.endswith(base_domain)) and is_valid_path(full_path):
+                        valid_paths.add(full_path)
+                findings[key] = list(valid_paths)
+            else:
+                findings[key] = list(matches)
+
+    return findings
+
+def crawler_thread(allowed_domain, output_file):
+    """Thread function to process URLs from the queue."""
+    def output(text):
+        with OUTPUT_LOCK:
+            with open(output_file, 'a') as f:
+                f.write(text + '\n')
+            print(text)
+
+    while not DONE_EVENT.is_set() or not URL_QUEUE.empty():
+        try:
+            url, depth = URL_QUEUE.get(timeout=1)
+        except Empty:
+            continue
+
+        with VISITED_URLS_LOCK:
+            if url in VISITED_URLS or depth > MAX_DEPTH:
+                URL_QUEUE.task_done()
+                continue
+            VISITED_URLS.add(url)
+
+        content, status, error = fetch_content(url)
+        if not content or status != 200:
+            output(f"Failed: {url} - {error or 'Unknown error'}")
+            URL_QUEUE.task_done()
+            continue
+
+        output(url)
+
+        is_js = url.endswith('.js')
+        findings = crawl_content(content, url, allowed_domain, "js" if is_js else "html")
+
+        if is_js and findings:
+            for key, items in findings.items():
+                if key not in ("urls", "paths", "relative_paths"):
+                    for item in sorted(items):
+                        output(f"{url} [Sensitive: {key}] {item}")
+
+        if not is_js:
+            js_urls = extract_js_from_html(content, url, allowed_domain)
+            for js_url in js_urls:
+                output(js_url)
+                with VISITED_URLS_LOCK:
+                    if js_url not in VISITED_URLS:
+                        URL_QUEUE.put((js_url, depth + 1))
+
+        if "urls" in findings:
+            for new_url in findings["urls"]:
+                output(new_url)
+                with VISITED_URLS_LOCK:
+                    if new_url not in VISITED_URLS:
+                        URL_QUEUE.put((new_url, depth + 1))
+
+        URL_QUEUE.task_done()
+
+def main():
+    if len(sys.argv) < 5 or sys.argv[1] != '-u' or sys.argv[3] != '-o':
+        print("Hey babe, usage: python3 crawl.py -u <url> -o <output_file> [-t <threads>]")
+        sys.exit(1)
+
+    url = sys.argv[2]
+    output_file = sys.argv[4]
+    num_threads = 2
+
+    if len(sys.argv) == 7 and sys.argv[5] == '-t':
+        try:
+            num_threads = int(sys.argv[6])
+            if num_threads < 1:
+                print("Babe, thread count gotta be at least 1!")
+                sys.exit(1)
+        except ValueError:
+            print("Babe, thread count needs to be a number!")
+            sys.exit(1)
+
+    if not url.startswith(('http://', 'https://')):
+        print("Babe, URL’s gotta start with http:// or https://!")
+        sys.exit(1)
+
+    allowed_domain = urlparse(url).netloc
+    if not allowed_domain:
+        print("Babe, couldn’t figure out the domain from that URL!")
+        sys.exit(1)
+
+    print(f"Babe, kicking off the crawl from {url} with {num_threads} threads...")
+    URL_QUEUE.put((url, 0))
+
+    threads = []
+    for _ in range(num_threads):
+        t = threading.Thread(target=crawler_thread, args=(allowed_domain, output_file))
+        t.start()
+        threads.append(t)
+
+    URL_QUEUE.join()
+    DONE_EVENT.set()
+
+    for t in threads:
+        t.join()
+
+    print("Babe, crawl’s done—check it out!")
+
+if __name__ == "__main__":
+    try:
+        import bs4
+    except ImportError:
+        print("Babe, installing BeautifulSoup4 real quick...")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "beautifulsoup4"])
+    main()
