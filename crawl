@@ -1,0 +1,1 @@
+The tool is capable of crawling a domain or subdomain's source code. It can detect any sensitive information, such as tokens or secrets, using regex patterns. Additionally, the tool is compatible with JavaScript crawling; it can crawl JavaScript files to identify any sensitive information, links, or paths, and then provide the results to us.
